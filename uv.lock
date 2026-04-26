@@ -1017,6 +1017,7 @@ dependencies = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
+    { name = "python-dotenv" },
     { name = "schedule" },
     { name = "yfinance" },
 ]
@@ -1027,6 +1028,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0.0" },
     { name = "openpyxl", specifier = ">=3.1.0" },
     { name = "pandas", specifier = ">=2.0.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "schedule", specifier = ">=1.2.0" },
     { name = "yfinance", specifier = ">=0.2.40" },
 ]

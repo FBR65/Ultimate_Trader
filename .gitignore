@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+.env.local
+.env.production
+*.xlsx
+portfolio_state.json
+portfolio_state.json.tmp
