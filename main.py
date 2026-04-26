@@ -10,6 +10,7 @@ import json
 import logging
 import schedule
 import time
+import base64
 from datetime import datetime, date
 from typing import Optional
 
@@ -237,42 +238,59 @@ class TradingEngine:
             logger.error("Excel export failed: pandas not installed")
             return "Fehler: pandas nicht installiert. Bitte 'pip install pandas openpyxl' ausführen."
 
-    def send_email_report(self, subject: str, body: str) -> str:
+    def send_email_report(self, subject: str, body: str, html_body: str = "") -> str:
         """
-        Sendet einen Statusbericht per E-Mail.
-        Lädt SMTP-Daten aus den Umgebungsvariablen.
+        Sendet einen Statusbericht per E-Mail über Gmail API.
+        Nutzt die Dienst-Account oder OAuth2-Zugangsdaten des Bots.
         """
         try:
-            import smtplib
+            import json
+            from googleapiclient.discovery import build
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
             from email.mime.text import MIMEText
             from email.mime.multipart import MIMEMultipart
 
-            # Validate config
-            user = self.email_config.get("user")
-            password = self.email_config.get("pass")
-            if not user or not password:
-                logger.warning("Email skipped: SMTP credentials missing in environment")
-                return "E-Mail übersprungen: SMTP-Zugangsdaten fehlen in .env"
+            TOKEN_PATH = '/home/hermes/.hermes/google_token.json'
+            with open(TOKEN_PATH, 'r') as fh:
+                token_data = json.load(fh)
 
-            msg = MIMEMultipart()
+            creds = Credentials(
+                token=token_data['token'],
+                refresh_token=token_data.get('refresh_token'),
+                token_uri=token_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                client_id=token_data['client_id'],
+                client_secret=token_data['client_secret'],
+                scopes=token_data['scopes']
+            )
+
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                token_data['token'] = creds.token
+                with open(TOKEN_PATH, 'w') as fh:
+                    json.dump(token_data, fh)
+
+            service = build('gmail', 'v1', credentials=creds)
+
+            sender = os.getenv("GMAIL_SENDER", "emil.mazdarati@gmail.com")
+            recipient = os.getenv("GMAIL_RECIPIENT", "frank.b.reis@gmail.com")
+
+            msg = MIMEMultipart('alternative')
             msg['Subject'] = f"Trading Bot Update: {subject}"
-            msg['From'] = self.email_config["from"] or user
-            msg['To'] = self.email_config["to"] or user
+            msg['From'] = sender
+            msg['To'] = recipient
             msg.attach(MIMEText(body, 'plain'))
+            if html_body:
+                msg.attach(MIMEText(html_body, 'html'))
 
-            with smtplib.SMTP(self.email_config["smtp_server"], self.email_config["port"]) as server:
-                server.starttls()
-                server.login(user, password)
-                server.send_message(msg)
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+            service.users().messages().send(userId='me', body={'raw': raw}).execute()
 
-            logger.info("Email sent: %s", subject)
-            return f"E-Mail-Bericht '{subject}' erfolgreich gesendet."
-        except smtplib.SMTPException as exc:
-            logger.error("SMTP error: %s", exc)
-            return f"SMTP-Fehler: {exc}"
+            logger.info("Gmail API: E-Mail '%s' gesendet an %s", subject, recipient)
+            return f"Gmail-API: E-Mail '{subject}' erfolgreich gesendet an {recipient}."
         except Exception as exc:
-            logger.error("Email send failed: %s", exc)
-            return f"E-Mail-Versand fehlgeschlagen: {exc}"
+            logger.error("Gmail API send failed: %s", exc)
+            return f"Gmail-API E-Mail-Versand fehlgeschlagen: {exc}"
 
 
 # ============================================================================
@@ -309,17 +327,27 @@ STRATEGY_2026 = [
 # Initialize the trading engine
 engine = TradingEngine()
 
-# Load Ollama config from environment
-ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5:latest")
+# Load LLM config from environment (OpenRouter by default, Ollama optional)
+llm_provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
+if llm_provider == "ollama":
+    llm_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    llm_model = os.getenv("OLLAMA_MODEL", "qwen2.5:latest")
+    llm_api_key = "test"
+else:
+    # OpenRouter (default)
+    llm_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    llm_model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+    llm_api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not llm_api_key:
+        logger.warning("OPENROUTER_API_KEY nicht gesetzt! Agent kann nicht chatten.")
 
 # Create the trading agent (agno 2.x compatible)
 trading_agent = Agent(
     name="Ultimate-Trader",
     model=OpenAIChat(
-        id=ollama_model,
-        base_url=ollama_base_url,
-        api_key="test"
+        id=llm_model,
+        base_url=llm_base_url,
+        api_key=llm_api_key
     ),
     tools=[
         YFinanceTools(enable_stock_price=True, enable_stock_fundamentals=True, enable_analyst_recommendations=True),
