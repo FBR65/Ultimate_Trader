@@ -327,14 +327,16 @@ STRATEGY_2026 = [
 # Initialize the trading engine
 engine = TradingEngine()
 
-# Load LLM config from environment (OpenRouter by default, Ollama optional)
-llm_provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
+# Load LLM config from environment (Ollama by default, OpenRouter optional)
+llm_provider = os.getenv("LLM_PROVIDER", "ollama").lower()
 if llm_provider == "ollama":
-    llm_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    llm_base_url = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1")
     llm_model = os.getenv("OLLAMA_MODEL", "qwen2.5:latest")
-    llm_api_key = "test"
+    llm_api_key = os.getenv("OLLAMA_API_KEY", "")
+    if not llm_api_key:
+        logger.warning("OLLAMA_API_KEY nicht gesetzt! Agent kann nicht chatten.")
 else:
-    # OpenRouter (default)
+    # OpenRouter
     llm_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     llm_model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
     llm_api_key = os.getenv("OPENROUTER_API_KEY", "")
@@ -420,13 +422,18 @@ if __name__ == "__main__":
     print(f"- Tageslimit: {engine.daily_spending_limit} €")
     print(f"- Stop-Loss: {int(engine.stop_loss_threshold * 100)}%")
     print(f"- Handelsgebühr: {int(engine.fee_rate * 100)}%")
-    print(f"- Modell: qwen2.5:latest")
+    print(f"- Modell: {llm_model}")
     print("\nWähle eine Option:")
     print("1. Einmalige Ausführung (jetzt)")
     print("2. Automatischer Scheduler (täglich um 09:05 Uhr)")
     print("3. Manuelle Abfrage")
     
-    choice = input("\nAuswahl (1-3): ").strip()
+    # Auto-Modus für Daemon: Umgehung des interaktiven Prompts
+    auto_mode = os.getenv("ULTIMATE_TRADER_AUTO", "").strip()
+    if auto_mode.lower() in ("1", "yes", "true", "scheduler"):
+        choice = "2"
+    else:
+        choice = input("\nAuswahl (1-3): ").strip()
     
     if choice == "1":
         # Einmalige Ausführung
