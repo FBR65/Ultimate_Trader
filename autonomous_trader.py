@@ -49,9 +49,11 @@ DAILY_LIMIT = float(os.getenv("DAILY_SPENDING_LIMIT", "2000.0"))
 STOP_LOSS = float(os.getenv("STOP_LOSS_THRESHOLD", "0.05"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))
 
-# Core/Satellite-Allokation (Beta-Forschung: 60–80% Low-Beta-Core)
-CORE_ALLOCATION = float(os.getenv("CORE_ALLOCATION", "0.70"))      # 70% Low-Beta-Core
-SATELLITE_ALLOCATION = float(os.getenv("SATELLITE_ALLOCATION", "0.30"))  # 30% Satellite
+# Core/Satellite/Bonds-Allokation (Norwegen-Modell: 70% Aktien, 30% Anleihen)
+CORE_ALLOCATION = float(os.getenv("CORE_ALLOCATION", "0.70"))      # 70% Aktien gesamt
+SATELLITE_ALLOCATION = float(os.getenv("SATELLITE_ALLOCATION", "0.30"))  # davon 30% Satellite
+BOND_ALLOCATION = float(os.getenv("BOND_ALLOCATION", "0.30"))       # 30% Anleihen (Norwegen-Modell)
+EQUITY_ALLOCATION = float(os.getenv("EQUITY_ALLOCATION", "0.70"))   # 70% Aktien gesamt
 CORE_BETA_MAX = 0.90   # Beta ≤ 0.9 für Core (Minimum-Volatility, defensiv)
 CORE_BETA_MIN = 0.40   # Beta ≥ 0.4 (keine extrem illiquiden Assets)
 SATELLITE_BETA_MIN = 0.90  # Satellite: Beta 0.9–1.2 (moderat)
@@ -81,8 +83,31 @@ SATELLITE_TICKERS = [
     "QDVE.DE",    # iShares MSCI USA Quality Factor
 ]
 
+# BONDS (30% Allokation — Norwegen-Modell: Staats- + Unternehmensanleihen)
+BOND_TICKERS = [
+    "DBXG.DE",    # Xtrackers II Global Government Bond UCITS ETF 1C EUR Hedged (LU0378818131)
+    "LYQ2.DE",    # Amundi Core EUR Corporate Bond UCITS ETF EUR Acc (LU1434522988)
+]
+
+# DIVIDENDEN-QUALITÄTS-WATCHLIST (Core-geeignet, stabil wie Low-Beta)
+DIVIDEND_TICKERS = [
+    "TDIV.DE",    # VanEck Morningstar Developed Markets Dividend Leaders (NL0011683594, TER 0.38%)
+    "VHYL.DE",    # Vanguard FTSE All-World High Dividend Yield (IE00B8GKDB10, TER 0.29%)
+    "SD3P.DE",    # iShares STOXX Global Select Dividend 100 (DE000A0F5UH1, TER 0.46%)
+]
+
+# US-Exposure-Map (geschätzte US-Gewichtung in % für US-Tracker)
+US_EXPOSURE_MAP = {
+    "SPY": 100, "VTI": 100, "QQQ": 100, "QDVE.DE": 100,
+    "XD9U.DE": 100, "SPHD": 100, "HNDL": 85, "HDLV.DE": 100,
+    "EUNL.DE": 69, "IQQ0.DE": 65, "XDEB.DE": 65, "VWCE.DE": 59,
+    "XLU": 100, "XLV": 100, "MVEE.DE": 0,
+    "TDIV.DE": 35, "VHYL.DE": 37, "SD3P.DE": 25,
+    "DBXG.DE": 0, "LYQ2.DE": 0,
+}
+
 # Alle Ticker (für Info-Screen)
-SCAN_TICKERS = CORE_TICKERS + SATELLITE_TICKERS
+SCAN_TICKERS = CORE_TICKERS + SATELLITE_TICKERS + BOND_TICKERS + DIVIDEND_TICKERS
 
 
 def load_portfolio() -> dict:
@@ -200,6 +225,32 @@ def get_info(symbol: str, tv_beta_cache: dict = None) -> dict:
         return {"beta": beta, "name": symbol, "vol_w": vol_w, "vol_m": vol_m}
 
 
+def estimate_us_exposure(portfolio: dict) -> tuple:
+    """Schätzt US-Anteil des Aktien-Portfolios anhand der US_EXPOSURE_MAP.
+    Returns: (us_pct, us_value, total_equity_value, warning_string_or_none)"""
+    total_equity = 0.0
+    us_value = 0.0
+    for sym, pos in portfolio["positions"].items():
+        tier = pos.get("tier", "core")
+        if tier == "bonds":
+            continue  # Anleihen zählen nicht zum Aktien-Exposure
+        val = pos["shares"] * pos.get("last_price", pos["avg_price"])
+        total_equity += val
+        us_pct = US_EXPOSURE_MAP.get(sym, 50)  # Default: 50% falls unbekannt
+        us_value += val * (us_pct / 100)
+
+    if total_equity > 0:
+        us_overall_pct = (us_value / total_equity) * 100
+    else:
+        us_overall_pct = 0.0
+
+    warning = None
+    if us_overall_pct > 65:
+        warning = f"⚠️ US-Anteil {us_overall_pct:.0f}% überschreitet 65%-Schwelle (Ziel: ≤55%)"
+    return us_overall_pct, us_value, total_equity, warning
+
+
+
 def fetch_tv_beta(tickers: list = None) -> dict:
     """Ruft Beta-Daten von TradingView ETF Screener API ab.
     Nutzt Name-basierte Suche für exaktes Matching.
@@ -210,7 +261,7 @@ def fetch_tv_beta(tickers: list = None) -> dict:
     try:
         url = 'https://scanner.tradingview.com/global/scan'
         if tickers is None:
-            raw = [t.replace(".DE", "") for t in CORE_TICKERS + SATELLITE_TICKERS]
+            raw = [t.replace(".DE", "") for t in CORE_TICKERS + SATELLITE_TICKERS + BOND_TICKERS + DIVIDEND_TICKERS]
             tickers = list(dict.fromkeys(raw))
         else:
             tickers = list(dict.fromkeys(tickers))  # Dedup
@@ -443,28 +494,30 @@ def check_stop_loss(portfolio: dict) -> list:
 
 
 def scan_opportunities(portfolio: dict) -> dict:
-    """Scannt Watchlist + dynamische ETF-Discovery nach Kaufgelegenheiten mit Core/Satellite-Allokation.
+    """Scannt Watchlist + dynamische ETF-Discovery nach Kaufgelegenheiten.
 
-    Strategie:
-    - CORE (70%): Beta 0.4–0.9 — Low-Beta-Anomalie ausnutzen.
-      Scoring belohnt NIEDRIGES Beta.
-    - SATELLITE (30%): Beta 0.9–1.2 — moderate Rendite-Chancen.
+    Strategie (Norwegen-Modell):
+    - BONDS (30%): Staats- + Unternehmensanleihen-ETFs
+    - CORE (70% der Aktien): Low-Beta-ETFs (Beta 0.4–0.9), Minimum-Volatility + Dividenden-Qualität
+      Scoring belohnt NIEDRIGES Beta. Dividenden-ETFs: belohnt 2.5-4.5% Rendite.
+    - SATELLITE (30% der Aktien): Breite Markt-ETFs (Beta 0.9–1.2)
       Scoring belohnt Beta nahe 1.0.
 
-    Kombiniert statische Watchlist (CORE_TICKERS, SATELLITE_TICKERS) mit
-    dynamischer ETF-Discovery via TradingView-API.
+    Super-Dividend-Schutz: Ausschüttungsrendite >6% → überspringen.
 
-    Returns: {"core": [...], "satellite": [...]} — sortierte Kandidaten."""
+    Kombiniert statische Watchlist mit dynamischer ETF-Discovery via TradingView-API.
+
+    Returns: {"core": [...], "satellite": [...], "bonds": [...]} — sortierte Kandidaten."""
     core_candidates = []
     satellite_candidates = []
+    bond_candidates = []
     seen_symbols = set()  # Dedup statisch vs. dynamisch
 
     # 1. Dynamische ETF-Discovery (TradingView Beta-Range-Scan)
     discovered = discover_etfs()
 
     # 2. TradingView-Beta-Daten für alle Ticker abrufen
-    #    Sammle alle TV-Symbole: statische + entdeckte
-    static_raw = [t.replace(".DE", "") for t in CORE_TICKERS + SATELLITE_TICKERS]
+    static_raw = [t.replace(".DE", "") for t in CORE_TICKERS + SATELLITE_TICKERS + BOND_TICKERS + DIVIDEND_TICKERS]
     discovered_names = []
     for tier in ("core", "satellite"):
         for etf in discovered.get(tier, []):
@@ -473,7 +526,7 @@ def scan_opportunities(portfolio: dict) -> dict:
             if name not in seen_symbols:
                 seen_symbols.add(name)
                 info = {
-                    "symbol": name,  # Verwende TV-Symbol für yfinance
+                    "symbol": name,
                     "price": None,
                     "beta": etf["beta_1y"],
                     "pe": None,
@@ -483,16 +536,15 @@ def scan_opportunities(portfolio: dict) -> dict:
                     "beta_source": "tv-discovery",
                     "vol_w": etf.get("vol_w"),
                     "vol_m": etf.get("vol_m"),
+                    "dividend_yield": None,
                 }
 
                 if tier == "core":
-                    # Core-Scoring: niedrigeres Beta = besser
                     beta = etf["beta_1y"]
                     score = 100 - ((beta - CORE_BETA_MIN) / (CORE_BETA_MAX - CORE_BETA_MIN)) * 50
                     info["score"] = round(score, 1)
                     core_candidates.append(info)
                 else:
-                    # Satellite-Scoring: näher an 1.0 = besser
                     beta = etf["beta_1y"]
                     score = 100 - abs(beta - 1.0) * 50
                     info["score"] = round(score, 1)
@@ -502,11 +554,11 @@ def scan_opportunities(portfolio: dict) -> dict:
     all_tv_names = list(set(static_raw + discovered_names))
     tv_beta_cache = fetch_tv_beta(tickers=all_tv_names)
 
-    # Verarbeite statische Ticker (nur wenn nicht schon via Discovery gefunden)
+    # --- Core-Ticker ---
     for symbol in CORE_TICKERS:
         tv_sym = symbol.replace(".DE", "")
         if tv_sym in seen_symbols:
-            continue  # Bereits via Discovery abgedeckt
+            continue
         seen_symbols.add(tv_sym)
 
         price = get_price(symbol)
@@ -519,16 +571,14 @@ def scan_opportunities(portfolio: dict) -> dict:
         if CORE_BETA_MIN <= beta <= CORE_BETA_MAX and (pe is None or pe < 30):
             score = 100 - ((beta - CORE_BETA_MIN) / (CORE_BETA_MAX - CORE_BETA_MIN)) * 50
             core_candidates.append({
-                "symbol": symbol,
-                "price": price,
-                "beta": beta,
-                "pe": pe,
-                "score": round(score, 1),
-                "tier": "core",
+                "symbol": symbol, "price": price, "beta": beta, "pe": pe,
+                "score": round(score, 1), "tier": "core",
                 "name": info.get("name", symbol),
                 "beta_source": "tv" if tv_beta_cache else "yfinance",
+                "dividend_yield": None,
             })
 
+    # --- Satellite-Ticker ---
     for symbol in SATELLITE_TICKERS:
         tv_sym = symbol.replace(".DE", "")
         if tv_sym in seen_symbols:
@@ -545,15 +595,79 @@ def scan_opportunities(portfolio: dict) -> dict:
         if SATELLITE_BETA_MIN <= beta <= 1.20 and (pe is None or pe < 30):
             score = 100 - abs(beta - 1.0) * 50
             satellite_candidates.append({
-                "symbol": symbol,
-                "price": price,
-                "beta": beta,
-                "pe": pe,
-                "score": round(score, 1),
-                "tier": "satellite",
+                "symbol": symbol, "price": price, "beta": beta, "pe": pe,
+                "score": round(score, 1), "tier": "satellite",
                 "name": info.get("name", symbol),
                 "beta_source": "tv" if tv_beta_cache else "yfinance",
+                "dividend_yield": None,
             })
+
+    # --- Dividenden-Qualitäts-Ticker (Core, Scoring nach Ausschüttungsrendite) ---
+    for symbol in DIVIDEND_TICKERS:
+        tv_sym = symbol.replace(".DE", "")
+        if tv_sym in seen_symbols:
+            continue
+        seen_symbols.add(tv_sym)
+
+        price = get_price(symbol)
+        if not price:
+            continue
+
+        # Super-Dividend-Schutz: yfinance dividendYield prüfen
+        div_yield = None
+        try:
+            ticker = yf.Ticker(symbol)
+            div_yield = ticker.info.get("dividendYield")
+        except Exception:
+            pass
+
+        if div_yield is not None and div_yield > 0.06:
+            logger.info("Super-Dividend-Falle ausgeschlossen: %s (Yield: %.1f%%)", symbol, div_yield * 100)
+            continue
+
+        # Dividenden-Scoring: sweet spot 2.5–4.5%, bestrafen >6%
+        if div_yield and 0.025 <= div_yield <= 0.045:
+            div_score = 90.0
+        elif div_yield:
+            div_score = max(30, 100 - abs(div_yield - 0.035) * 1000)
+        else:
+            div_score = 60.0  # Unknown yield, neutral
+
+        info = get_info(symbol, tv_beta_cache=tv_beta_cache)
+        beta = info.get("beta")
+        core_candidates.append({
+            "symbol": symbol, "price": price,
+            "beta": beta if beta else 0.7,  # Dividenden-ETFs ≈ Low-Beta
+            "pe": info.get("trailingPE"),
+            "score": round(div_score, 1),
+            "tier": "core",
+            "name": info.get("name", symbol),
+            "beta_source": "tv" if tv_beta_cache else "yfinance",
+            "dividend_yield": div_yield,
+        })
+
+    # --- Anleihen-Ticker (Bonds) ---
+    for symbol in BOND_TICKERS:
+        tv_sym = symbol.replace(".DE", "")
+        if tv_sym in seen_symbols:
+            continue
+        seen_symbols.add(tv_sym)
+
+        price = get_price(symbol)
+        if not price:
+            continue
+
+        bond_candidates.append({
+            "symbol": symbol,
+            "price": price,
+            "beta": 0.0,  # Bonds ≈ beta 0
+            "pe": None,
+            "score": 80.0,  # Neutraler Score für Anleihen
+            "tier": "bonds",
+            "name": symbol,
+            "beta_source": "static",
+            "dividend_yield": None,
+        })
 
     # 4. Preise für Discovery-Ticker nachladen (yfinance)
     unpriced = 0
@@ -568,30 +682,31 @@ def scan_opportunities(portfolio: dict) -> dict:
             else:
                 unpriced += 1
 
-    # Unbepreiste Kandidaten rausfiltern (XETR-Ticker ohne yfinance-Abdeckung)
     core_candidates = [c for c in core_candidates if c["price"] is not None]
     satellite_candidates = [c for c in satellite_candidates if c["price"] is not None]
 
     if unpriced:
         logger.info("%d Discovery-Ticker ohne yfinance-Preis ausgefiltert", unpriced)
 
-    # Sortieren: beste zuerst
     core_candidates.sort(key=lambda x: x["score"], reverse=True)
     satellite_candidates.sort(key=lambda x: x["score"], reverse=True)
+    bond_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    logger.info("Kandidaten: %d Core / %d Satellite (davon %d via Discovery)",
-                len(core_candidates), len(satellite_candidates),
+    logger.info("Kandidaten: %d Core / %d Satellite / %d Bonds (davon %d via Discovery)",
+                len(core_candidates), len(satellite_candidates), len(bond_candidates),
                 len(discovered.get("core", [])) + len(discovered.get("satellite", [])))
 
-    return {"core": core_candidates[:8], "satellite": satellite_candidates[:5]}
+    return {"core": core_candidates[:10], "satellite": satellite_candidates[:5], "bonds": bond_candidates[:3]}
 
 
 def run_strategy(portfolio: dict) -> list:
-    """Fuehrt die taegliche Handelsstrategie aus mit Core/Satellite-Allokation.
+    """Fuehrt die taegliche Handelsstrategie aus mit Bonds/Core/Satellite-Allokation.
 
-    Allokation (Beta-Forschung):
-    - 70% CORE: Low-Beta-ETFs (Beta 0.4–0.9), Minimum-Volatility
-    - 30% SATELLITE: Breite Markt-ETFs (Beta 0.9–1.2)
+    Allokation (Norwegen-Modell):
+    - 30% BONDS: Staats- + Unternehmensanleihen-ETFs
+    - 70% AKTIEN:
+      - CORE: Low-Beta-ETFs (Beta 0.4–0.9), Minimum-Volatility + Dividenden-Qualität
+      - SATELLITE: Breite Markt-ETFs (Beta 0.9–1.2)
 
     Nur Di–Do wird gekauft. Mo/Fr: Analyse & Rebalancing-Check.
     """
@@ -605,24 +720,37 @@ def run_strategy(portfolio: dict) -> list:
     else:
         actions.append("Keine Stop-Loss-Ausloesung.")
 
-    # 2. Aktuellen Allokations-Status berechnen
+    # 2. Aktuellen Allokations-Status berechnen (Bonds/Core/Satellite)
     core_value = 0.0
     sat_value = 0.0
+    bond_value = 0.0
     for sym, pos in portfolio["positions"].items():
         val = pos["shares"] * pos.get("last_price", pos["avg_price"])
-        if pos.get("tier", "core") == "core":
+        tier = pos.get("tier", "core")
+        if tier == "bonds":
+            bond_value += val
+        elif tier == "core":
             core_value += val
         else:
             sat_value += val
 
-    total_invested = core_value + sat_value
+    total_invested = core_value + sat_value + bond_value
     total_portfolio = portfolio["cash"] + total_invested
     core_pct = (core_value / total_portfolio * 100) if total_portfolio > 0 else 0
     sat_pct = (sat_value / total_portfolio * 100) if total_portfolio > 0 else 0
+    bond_pct = (bond_value / total_portfolio * 100) if total_portfolio > 0 else 0
+    equity_pct = core_pct + sat_pct
 
-    actions.append(f"Allokation: CORE {core_pct:.0f}% / SATELLITE {sat_pct:.0f}% (Ziel: {CORE_ALLOCATION*100:.0f}/{SATELLITE_ALLOCATION*100:.0f})")
+    actions.append(f"Allokation: BONDS {bond_pct:.0f}% / CORE {core_pct:.0f}% / SATELLITE {sat_pct:.0f}% (Ziel: {BOND_ALLOCATION*100:.0f}/{CORE_ALLOCATION*EQUITY_ALLOCATION*100:.0f}/{SATELLITE_ALLOCATION*EQUITY_ALLOCATION*100:.0f})")
 
-    # 3. Nur Dienstag bis Donnerstag: Neue Kauefe (Core/Satellite-gesteuert)
+    # 3. US-Exposure schätzen
+    us_pct, us_value, total_equity_val, us_warning = estimate_us_exposure(portfolio)
+    if us_warning:
+        actions.append(us_warning)
+    if total_equity_val > 0:
+        actions.append(f"US-Anteil: {us_pct:.0f}% (Ziel: ≤55%, Wert: €{us_value:,.0f})")
+
+    # 4. Nur Dienstag bis Donnerstag: Neue Käufe (Bonds/Core/Satellite-gesteuert)
     if 1 <= today <= 3:
         reset_daily_budget(portfolio)
         available = min(DAILY_LIMIT - portfolio.get("today_spent", 0), portfolio["cash"])
@@ -631,22 +759,38 @@ def run_strategy(portfolio: dict) -> list:
             candidates = scan_opportunities(portfolio)
             core_cands = candidates.get("core", [])
             sat_cands = candidates.get("satellite", [])
+            bond_cands = candidates.get("bonds", [])
 
-            # Priorität: Core auffüllen, wenn unter Ziel-Allokation
-            if core_pct < CORE_ALLOCATION * 100 - 5 and core_cands:
-                # Core untergewichtet → kaufe besten Core-Kandidaten
+            # Priorität 1: Bonds auffüllen wenn unter Ziel (Norwegen-Modell: 30%)
+            if bond_pct < BOND_ALLOCATION * 100 - 5 and bond_cands and available >= 500:
+                best = bond_cands[0]
+                buy_amount = min(1000.0, available)
+                trade = execute_buy(portfolio, best["symbol"], buy_amount, tier="bonds")
+                if trade:
+                    actions.append(
+                        f"BOND-KAUF: {best['symbol']} | €{buy_amount:.2f} (Score: {best['score']})"
+                    )
+                    available -= buy_amount
+
+            # Priorität 2: Core auffüllen, wenn unter Ziel-Allokation
+            target_core_pct = CORE_ALLOCATION * EQUITY_ALLOCATION * 100
+            if core_pct < target_core_pct - 5 and core_cands and available >= 500:
                 best = core_cands[0]
                 buy_amount = min(1200.0, available)
                 trade = execute_buy(portfolio, best["symbol"], buy_amount, tier="core")
                 if trade:
+                    div_info = ""
+                    if best.get("dividend_yield"):
+                        div_info = f", Div: {best['dividend_yield']*100:.1f}%"
                     actions.append(
                         f"CORE-KAUF: {best['symbol']} | €{buy_amount:.2f} "
-                        f"(Beta: {best['beta']:.2f}, Score: {best['score']})"
+                        f"(Beta: {best['beta']:.2f}, Score: {best['score']}{div_info})"
                     )
                     available -= buy_amount
 
-            # Satellite auffüllen, wenn noch Budget
-            if sat_pct < SATELLITE_ALLOCATION * 100 - 5 and sat_cands and available >= 500:
+            # Priorität 3: Satellite auffüllen, wenn noch Budget
+            target_sat_pct = SATELLITE_ALLOCATION * EQUITY_ALLOCATION * 100
+            if sat_pct < target_sat_pct - 5 and sat_cands and available >= 500:
                 best = sat_cands[0]
                 buy_amount = min(800.0, available)
                 trade = execute_buy(portfolio, best["symbol"], buy_amount, tier="satellite")
@@ -657,36 +801,43 @@ def run_strategy(portfolio: dict) -> list:
                     )
                     available -= buy_amount
 
-            if not core_cands and not sat_cands:
-                actions.append("Keine geeigneten Kaufkandidaten (Core oder Satellite).")
+            if not core_cands and not sat_cands and not bond_cands:
+                actions.append("Keine geeigneten Kaufkandidaten (Bonds/Core/Satellite).")
         else:
             actions.append(f"Budget zu gering (€{available:.2f}). Keine Käufe.")
 
     elif today == 0:
-        # Montag: Rebalancing-Analyse
+        # Montag: Rebalancing-Analyse (Norwegen-Modell: Bonds 25-35%, Core Equity, US ≤55%)
         drift_actions = []
-        # Prüfe ob Core >80% oder Satellite >40% (Rebalancing-Schwellen)
         if core_pct > 80:
             drift_actions.append(f"Core übergewichtet ({core_pct:.0f}%) — Rebalancing prüfen")
         if sat_pct > 40:
             drift_actions.append(f"Satellite übergewichtet ({sat_pct:.0f}%) — Rebalancing prüfen")
+        if bond_pct < 25:
+            drift_actions.append(f"Bonds untergewichtet ({bond_pct:.0f}%) — Nachkauf empfohlen")
+        if bond_pct > 35:
+            drift_actions.append(f"Bonds übergewichtet ({bond_pct:.0f}%) — Rebalancing prüfen")
+        if us_pct > 65:
+            drift_actions.append(f"US-Exposure zu hoch ({us_pct:.0f}%) — nicht-US Core beimischen")
         if drift_actions:
             actions.extend(drift_actions)
         else:
-            actions.append("Montag-Analyse: Allokation im Soll-Bereich.")
+            actions.append("Montag-Analyse: Allokation im Soll-Bereich (Norwegen-Modell).")
 
     elif today == 4:
         # Freitag: Wochen-Review
-        core_target = CORE_ALLOCATION * total_portfolio
-        sat_target = SATELLITE_ALLOCATION * total_portfolio
+        bond_target = BOND_ALLOCATION * total_portfolio
+        core_target = CORE_ALLOCATION * EQUITY_ALLOCATION * total_portfolio
+        sat_target = SATELLITE_ALLOCATION * EQUITY_ALLOCATION * total_portfolio
+        bond_drift = bond_value - bond_target
         core_drift = core_value - core_target
         sat_drift = sat_value - sat_target
         actions.append(
-            f"Freitag-Review: Core-Drift €{core_drift:+.0f}, "
-            f"Sat-Drift €{sat_drift:+.0f}"
+            f"Freitag-Review: Bond-Drift €{bond_drift:+.0f}, "
+            f"Core-Drift €{core_drift:+.0f}, Sat-Drift €{sat_drift:+.0f}"
         )
 
-    # 4. Klumpenrisiko (schärfer: >22% in EINER Position = Warnung)
+    # 5. Klumpenrisiko (>22% in EINER Position = Warnung)
     if len(portfolio["positions"]) >= 3:
         for sym, pos in portfolio["positions"].items():
             value = pos["shares"] * pos.get("last_price", pos["avg_price"])
@@ -707,9 +858,13 @@ def generate_report(portfolio: dict) -> tuple:
         for t in portfolio["history"]
     )
 
+    # US-Exposure
+    us_pct, us_value, total_equity_val, _ = estimate_us_exposure(portfolio)
+
     # Aktuelle Portfoliobewertung
     positions_val = 0.0
-    pos_list = []
+    bond_positions = []     # Anleihen separat
+    equity_positions = []   # Aktien (Core+Satellite) separat
     for symbol, pos in portfolio["positions"].items():
         current_p = get_price(symbol)
         if current_p is None:
@@ -719,8 +874,32 @@ def generate_report(portfolio: dict) -> tuple:
         pnl_pct = ((current_p - pos["avg_price"]) / pos["avg_price"]) * 100 if pos["avg_price"] > 0 else 0
         positions_val += value
         tier = pos.get("tier", "core")
-        tier_label = "🛡️" if tier == "core" else "🚀"
-        pos_list.append(f"| {symbol} | {tier_label} {tier.upper()} | {pos['shares']:.4f} | €{pos['avg_price']:.2f} | €{current_p:.2f} | €{value:.2f} | {pnl_pct:+.2f}% |")
+
+        # Versuche Dividendenrendite von yfinance
+        div_yield = None
+        if tier in ("core", "satellite"):
+            try:
+                div_yield = yf.Ticker(symbol).info.get("dividendYield")
+            except Exception:
+                pass
+
+        if tier == "bonds":
+            tier_label = "🏦"
+            bond_positions.append(
+                f"| {symbol} | {tier_label} BONDS | {pos['shares']:.4f} | €{pos['avg_price']:.2f} | €{current_p:.2f} | €{value:.2f} | {pnl_pct:+.2f}% |"
+            )
+        elif tier == "core":
+            tier_label = "🛡️"
+            div_suffix = f" (Div: {div_yield*100:.1f}%)" if div_yield else ""
+            equity_positions.append(
+                f"| {symbol} | {tier_label} CORE | {pos['shares']:.4f} | €{pos['avg_price']:.2f} | €{current_p:.2f} | €{value:.2f} | {pnl_pct:+.2f}%{div_suffix} |"
+            )
+        else:
+            tier_label = "🚀"
+            div_suffix = f" (Div: {div_yield*100:.1f}%)" if div_yield else ""
+            equity_positions.append(
+                f"| {symbol} | {tier_label} SAT | {pos['shares']:.4f} | €{pos['avg_price']:.2f} | €{current_p:.2f} | €{value:.2f} | {pnl_pct:+.2f}%{div_suffix} |"
+            )
 
     total_value = portfolio["cash"] + positions_val
     total_return_pct = ((total_value - START_CAPITAL) / START_CAPITAL) * 100
@@ -734,7 +913,7 @@ def generate_report(portfolio: dict) -> tuple:
 
     plain = f"""
 ============================================
-ULTIMATE TRADER - TAGESBERICHT
+ULTIMATE TRADER - TAGESBERICHT (Norwegen-Modell)
 {now.strftime('%A, %d.%m.%Y %H:%M')}
 ============================================
 
@@ -746,15 +925,28 @@ KAPITALUEBERSICHT:
   Gewinn/Verlust:   €{total_value - START_CAPITAL:,.2f} ({total_return_pct:+.2f}%)
   Trades bisher:    {portfolio.get('trade_count', 0)}
 
-POSITIONEN:
-  {'Symbol':<8} {'Stueck':<10} {'Einstand':<10} {'Aktuell':<10} {'Wert':<10} {'P/L %':<10}
-  {'-'*60}
+US-EXPOSURE (Aktien):
+  US-Anteil: {us_pct:.0f}% (Ziel: ≤55%, Wert: €{us_value:,.0f})
+  Gesamt-Aktienwert: €{total_equity_val:,.0f}
+
+ANLEIHEN:
 """
-    if pos_list:
-        for line in pos_list:
+    if bond_positions:
+        for line in bond_positions:
             plain += "  " + line + "\n"
     else:
-        plain += "  (Keine offenen Positionen)\n"
+        plain += "  (Keine Anleihen-Positionen)\n"
+
+    plain += """
+AKTIEN:
+  Symbol   Stueck     Einstand   Aktuell    Wert       P/L %     
+  ------------------------------------------------------------
+"""
+    if equity_positions:
+        for line in equity_positions:
+            plain += "  " + line + "\n"
+    else:
+        plain += "  (Keine Aktien-Positionen)\n"
 
     plain += f"""
 LETZTE TRADES:
@@ -768,7 +960,7 @@ LETZTE TRADES:
 
     # HTML-Version fuer E-Mail
     html = f"""
-<h1>🤖 Ultimate Trader - Tagesbericht</h1>
+<h1>🤖 Ultimate Trader - Tagesbericht (Norwegen-Modell)</h1>
 <p><strong>{now.strftime('%A, %d.%m.%Y %H:%M')}</strong></p>
 
 <h2>📊 Kapitaluebersicht</h2>
@@ -779,20 +971,45 @@ LETZTE TRADES:
   <li><b>Gesamtwert:</b> €{total_value:,.2f}</li>
   <li><b>Performance:</b> <span style='color:{"green" if total_return_pct >= 0 else "red"};'>{total_return_pct:+.2f}%</span></li>
   <li><b>Trades:</b> {portfolio.get('trade_count', 0)}</li>
+  <li><b>US-Anteil:</b> {us_pct:.0f}% (Ziel: ≤55%)</li>
 </ul>
 
-<h2>📈 Positionen</h2>
+<h2>🏦 Anleihen</h2>
 <table border='1' cellpadding='5'>
   <tr><th>Symbol</th><th>Tier</th><th>Stueck</th><th>Einstand</th><th>Aktuell</th><th>Wert</th><th>P/L %</th></tr>
 """
     for symbol, pos in portfolio["positions"].items():
+        tier = pos.get("tier", "core")
+        if tier != "bonds":
+            continue
         current_p = get_price(symbol) or pos.get("last_price", pos["avg_price"])
         value = pos["shares"] * current_p
         pnl_pct = ((current_p - pos["avg_price"]) / pos["avg_price"]) * 100 if pos["avg_price"] > 0 else 0
         color = "green" if pnl_pct >= 0 else "red"
+        html += f"  <tr><td>{symbol}</td><td>🏦 BONDS</td><td>{pos['shares']:.4f}</td><td>€{pos['avg_price']:.2f}</td><td>€{current_p:.2f}</td><td>€{value:.2f}</td><td style='color:{color}'>{pnl_pct:+.2f}%</td></tr>\n"
+    html += "</table><p></p>"
+
+    html += """
+<h2>📈 Aktien</h2>
+<table border='1' cellpadding='5'>
+  <tr><th>Symbol</th><th>Tier</th><th>Stueck</th><th>Einstand</th><th>Aktuell</th><th>Wert</th><th>P/L %</th><th>Div</th></tr>
+"""
+    for symbol, pos in portfolio["positions"].items():
         tier = pos.get("tier", "core")
+        if tier == "bonds":
+            continue
+        current_p = get_price(symbol) or pos.get("last_price", pos["avg_price"])
+        value = pos["shares"] * current_p
+        pnl_pct = ((current_p - pos["avg_price"]) / pos["avg_price"]) * 100 if pos["avg_price"] > 0 else 0
+        color = "green" if pnl_pct >= 0 else "red"
         tier_label = "🛡️ CORE" if tier == "core" else "🚀 SAT"
-        html += f"  <tr><td>{symbol}</td><td>{tier_label}</td><td>{pos['shares']:.4f}</td><td>€{pos['avg_price']:.2f}</td><td>€{current_p:.2f}</td><td>€{value:.2f}</td><td style='color:{color}'>{pnl_pct:+.2f}%</td></tr>\\n"
+        div_yield = None
+        try:
+            div_yield = yf.Ticker(symbol).info.get("dividendYield")
+        except Exception:
+            pass
+        div_str = f"{div_yield*100:.1f}%" if div_yield else "—"
+        html += f"  <tr><td>{symbol}</td><td>{tier_label}</td><td>{pos['shares']:.4f}</td><td>€{pos['avg_price']:.2f}</td><td>€{current_p:.2f}</td><td>€{value:.2f}</td><td style='color:{color}'>{pnl_pct:+.2f}%</td><td>{div_str}</td></tr>\n"
     html += "</table><p></p>"
 
     return plain, html
